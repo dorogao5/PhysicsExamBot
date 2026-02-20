@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mihailov-bot"
+version = "0.1.0"
+description = "Telegram physics examiner bot powered by Qwen3-Max and Qwen OCR"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "aiosqlite>=0.20.0",
+  "httpx>=0.27.2",
+  "Pillow>=10.4.0",
+  "pydantic>=2.9.2",
+  "pydantic-settings>=2.6.1",
+  "python-dotenv>=1.0.1",
+  "python-telegram-bot>=22.0",
+  "pypdfium2>=4.30.0",
+  "tenacity>=9.0.0"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.3",
+  "pytest-asyncio>=0.24.0"
+]
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"
