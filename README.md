@@ -23,7 +23,7 @@ pip install -e .
 cp .env.example .env
 # fill TELEGRAM_BOT_TOKEN and DASHSCOPE_API_KEY
 # optional for production persistence:
-# DATA_DIR=/var/lib/mihailov_bot
+# DATA_DIR=/var/lib/physics_bot
 python main.py
 ```
 
@@ -46,11 +46,11 @@ python main.py
 
 ## Safe deploy (no data loss)
 1. Keep runtime data outside the code directory:
-   - Set `DATA_DIR=/var/lib/mihailov_bot` in `.env`.
+   - Set `DATA_DIR=/var/lib/physics_bot` in `.env`.
    - Optional fine-tuning: `COURSES_DIR`, `DB_PATH`, `TMP_DIR`.
 2. Before first migration, copy existing local data:
-   - `mkdir -p /var/lib/mihailov_bot`
-   - `cp -a data/. /var/lib/mihailov_bot/`
+   - `mkdir -p /var/lib/physics_bot`
+   - `cp -a data/. /var/lib/physics_bot/`
 3. Run only one polling instance per bot token. Two processes with the same token will conflict.
 4. Do not delete `DB_PATH` and `COURSES_DIR` between deploys.
 
