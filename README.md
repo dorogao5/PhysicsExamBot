@@ -1,4 +1,4 @@
-# Mihailov Examiner Bot
+# Physics Examiner Bot
 
 Telegram bot for physics oral exams based on:
 - `qwen3-max` for exam logic and grading
