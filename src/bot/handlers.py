@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from uuid import uuid4
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -13,19 +14,37 @@ from src.bot.course_service import CourseService
 from src.bot.text_format import markdownish_to_telegram_html
 from src.config.settings import Settings
 from src.exam.engine import ExamEngine
+from src.knowledge.retrieval import KnowledgeRetrieval
+from src.llm.gateway import DashScopeChatClient
 from src.storage.db import Database
 
 logger = logging.getLogger(__name__)
 
 UPLOAD_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
+TELEGRAM_MAX_MSG_LEN = 4096
+COMSA_QUESTION_COUNT = 15
+COMSA_COURSE_ID = 1
 
 
 class HandlerDeps:
-    def __init__(self, *, settings: Settings, db: Database, course_service: CourseService, exam_engine: ExamEngine):
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        db: Database,
+        course_service: CourseService,
+        exam_engine: ExamEngine,
+        retrieval: KnowledgeRetrieval,
+        llm_client: DashScopeChatClient,
+        comsa_questions: list[str],
+    ):
         self.settings = settings
         self.db = db
         self.course_service = course_service
         self.exam_engine = exam_engine
+        self.retrieval = retrieval
+        self.llm_client = llm_client
+        self.comsa_questions = comsa_questions
 
 
 def get_deps(context: ContextTypes.DEFAULT_TYPE) -> HandlerDeps:
@@ -54,6 +73,35 @@ async def _edit(status_message, text: str, **kwargs) -> None:
         await status_message.edit_text(text, **kwargs)
 
 
+def _split_message(text: str, max_len: int = TELEGRAM_MAX_MSG_LEN) -> list[str]:
+    if len(text) <= max_len:
+        return [text]
+    chunks: list[str] = []
+    while text:
+        if len(text) <= max_len:
+            chunks.append(text)
+            break
+        split_at = text.rfind("\n", 0, max_len)
+        if split_at <= 0:
+            split_at = max_len
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+    return chunks
+
+
+async def _reply_long(update: Update, text: str) -> None:
+    """Send a potentially long text, splitting into multiple messages."""
+    message = update.message
+    if not message:
+        return
+    rendered = markdownish_to_telegram_html(text)
+    for chunk in _split_message(rendered):
+        try:
+            await message.reply_text(chunk, parse_mode=ParseMode.HTML)
+        except BadRequest:
+            await message.reply_text(chunk)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply(
         update,
@@ -73,7 +121,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/use_course <id> - выбрать курс\n"
         "/exam_start - начать сдачу\n"
         "/exam_stop - завершить сдачу\n"
-        "/stats - показать статистику",
+        "/stats - показать статистику\n"
+        "/comsa_mode - вкл/выкл режим COMSA (15 случайных вопросов)\n"
+        "/show_answers - показать ответы на вопросы COMSA",
     )
 
 
@@ -261,6 +311,10 @@ async def cmd_exam_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not user or not chat:
         return
 
+    if context.user_data and context.user_data.get("comsa_mode"):
+        await _comsa_exam_start(update, context, deps)
+        return
+
     course = await deps.db.get_user_active_course(chat_id=chat.id, user_id=user.id)
     if not course:
         await _reply(
@@ -313,3 +367,98 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     reply = await deps.exam_engine.handle_answer(chat_id=chat.id, user_id=user.id, student_answer=message.text)
     if reply:
         await _reply(update, reply)
+
+
+# ---------------------------------------------------------------------------
+# COMSA mode handlers
+# ---------------------------------------------------------------------------
+
+async def cmd_comsa_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data is None:
+        return
+    current = context.user_data.get("comsa_mode", False)
+    context.user_data["comsa_mode"] = not current
+    if not current:
+        await _reply(update, "COMSA-режим включен. Используйте /exam_start для получения 15 случайных вопросов.")
+    else:
+        context.user_data.pop("comsa_questions", None)
+        await _reply(update, "COMSA-режим выключен. /exam_start вернётся к обычному экзамену.")
+
+
+async def _comsa_exam_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    deps: HandlerDeps,
+) -> None:
+    if not deps.comsa_questions:
+        await _reply(update, "Файл с вопросами COMSA не загружен.")
+        return
+
+    count = min(COMSA_QUESTION_COUNT, len(deps.comsa_questions))
+    selected = random.sample(deps.comsa_questions, count)
+    context.user_data["comsa_questions"] = selected
+
+    lines: list[str] = ["Вопросы COMSA:\n"]
+    for idx, q in enumerate(selected, 1):
+        lines.append(f"{idx}. {q}")
+    text = "\n".join(lines)
+
+    await _reply_long(update, text)
+
+
+async def cmd_show_answers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from src.config.prompts import COMSA_ANSWER_PROMPT
+
+    deps = get_deps(context)
+    if not context.user_data or not context.user_data.get("comsa_questions"):
+        await _reply(
+            update,
+            "Нет активных вопросов COMSA. Включите /comsa_mode и запустите /exam_start.",
+        )
+        return
+
+    questions: list[str] = context.user_data["comsa_questions"]
+    message = update.message
+    if not message:
+        return
+
+    status = await message.reply_text("Генерирую ответы на основе теормина...")
+
+    async def _answer_one(question_text: str) -> str:
+        try:
+            chunks = await deps.retrieval.lookup_theory(
+                course_id=COMSA_COURSE_ID,
+                query=question_text,
+                top_k=deps.settings.top_k_retrieval,
+            )
+            theory_context = "\n\n".join(c.text for c in chunks)
+            theory_context = theory_context[: deps.settings.max_context_chars]
+
+            prompt = (
+                f"Вопрос: {question_text}\n\n"
+                f"Теоретический материал:\n{theory_context}"
+            )
+            answer = await deps.llm_client.chat_text(
+                system_prompt=COMSA_ANSWER_PROMPT,
+                user_prompt=prompt,
+                max_tokens=800,
+                temperature=0.2,
+                enable_thinking=False,
+            )
+            return answer.strip()
+        except Exception as exc:
+            logger.exception("Failed to generate answer for: %s", question_text[:60])
+            return f"(ошибка генерации ответа: {exc})"
+
+    answers = await asyncio.gather(*[_answer_one(q) for q in questions])
+
+    lines: list[str] = ["Ответы на вопросы COMSA:\n"]
+    for idx, (q, a) in enumerate(zip(questions, answers), 1):
+        lines.append(f"**Вопрос {idx}.** {q}\n{a}\n")
+
+    try:
+        await status.delete()
+    except Exception:
+        pass
+
+    await _reply_long(update, "\n".join(lines))

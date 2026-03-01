@@ -5,13 +5,16 @@ import logging
 from telegram import BotCommand, Update
 from telegram.ext import Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
+from src.bot.comsa import load_comsa_questions
 from src.bot.course_service import CourseService
 from src.bot.handlers import (
     HandlerDeps,
+    cmd_comsa_mode,
     cmd_exam_start,
     cmd_exam_stop,
     cmd_help,
     cmd_courses,
+    cmd_show_answers,
     cmd_start,
     cmd_stats,
     cmd_use_course,
@@ -42,6 +45,8 @@ async def _post_init_application(application: Application) -> None:
         BotCommand("exam_start", "Начать экзамен"),
         BotCommand("exam_stop", "Завершить экзамен"),
         BotCommand("stats", "Показать статистику"),
+        BotCommand("comsa_mode", "Вкл/выкл режим COMSA"),
+        BotCommand("show_answers", "Ответы на вопросы COMSA"),
     ]
     try:
         await application.bot.set_my_commands(commands)
@@ -84,7 +89,23 @@ async def create_application(settings: Settings) -> Application:
     retrieval = KnowledgeRetrieval(db)
     exam_engine = ExamEngine(db=db, llm=llm_client, retrieval=retrieval, settings=settings)
 
-    deps = HandlerDeps(settings=settings, db=db, course_service=course_service, exam_engine=exam_engine)
+    comsa_path = settings.data_dir / "comsa_questions.md"
+    comsa_questions: list[str] = []
+    if comsa_path.exists():
+        comsa_questions = load_comsa_questions(comsa_path)
+        logger.info("Loaded %d COMSA questions from %s", len(comsa_questions), comsa_path)
+    else:
+        logger.warning("COMSA questions file not found at %s", comsa_path)
+
+    deps = HandlerDeps(
+        settings=settings,
+        db=db,
+        course_service=course_service,
+        exam_engine=exam_engine,
+        retrieval=retrieval,
+        llm_client=llm_client,
+        comsa_questions=comsa_questions,
+    )
 
     application = (
         ApplicationBuilder()
@@ -107,6 +128,8 @@ async def create_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("exam_start", cmd_exam_start))
     application.add_handler(CommandHandler("exam_stop", cmd_exam_stop))
     application.add_handler(CommandHandler("stats", cmd_stats))
+    application.add_handler(CommandHandler("comsa_mode", cmd_comsa_mode))
+    application.add_handler(CommandHandler("show_answers", cmd_show_answers))
     application.add_handler(CallbackQueryHandler(on_course_select_callback, pattern=r"^select_course:"))
 
     application.add_handler(MessageHandler(filters.Document.PDF, on_pdf_document))
